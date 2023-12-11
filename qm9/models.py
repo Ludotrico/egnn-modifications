@@ -3,6 +3,8 @@ import torch
 from torch import nn
 
 
+
+
 class E_GCL_mask(E_GCL):
     """Graph Neural Net with global state and fixed number of nodes per graph.
     Args:
@@ -40,7 +42,18 @@ class E_GCL_mask(E_GCL):
 
         return h, coord, edge_attr
 
+def select_neighborhood(edge_index, coord, threshold=0.5):
+    # Compute the Euclidean distance between nodes
+    row, col = edge_index
+    distance = torch.norm(coord[row] - coord[col], dim=1)
 
+    # Select edges where distance is below the threshold
+    mask = distance < threshold
+    return edge_index[:, mask]
+
+def prune_edges(edge_index, edge_attr, importance_scores, threshold=0.1):
+    mask = importance_scores > threshold
+    return edge_index[:, mask], edge_attr[mask]
 
 class EGNN(nn.Module):
     def __init__(self, in_node_nf, in_edge_nf, hidden_nf, device='cpu', act_fn=nn.SiLU(), n_layers=4, coords_weight=1.0, attention=False, node_attr=1):
@@ -69,13 +82,18 @@ class EGNN(nn.Module):
         self.to(self.device)
 
     def forward(self, h0, x, edges, edge_attr, node_mask, edge_mask, n_nodes):
-        h = self.embedding(h0)
         for i in range(0, self.n_layers):
-            if self.node_attr:
-                h, _, _ = self._modules["gcl_%d" % i](h, edges, x, node_mask, edge_mask, edge_attr=edge_attr, node_attr=h0, n_nodes=n_nodes)
-            else:
-                h, _, _ = self._modules["gcl_%d" % i](h, edges, x, node_mask, edge_mask, edge_attr=edge_attr,
-                                                      node_attr=None, n_nodes=n_nodes)
+            # Select neighborhood for each layer
+            selected_edges = select_neighborhood(edges, x)
+
+            # Calculate importance scores (example: use the gradient of edge_attr)
+            importance_scores = torch.abs(edge_attr.grad)
+
+            # Prune edges based on importance scores
+            pruned_edges, pruned_edge_attr = prune_edges(selected_edges, edge_attr, importance_scores)
+
+            # Forward pass with pruned edges
+            h, x, _ = self._modules["gcl_%d" % i](h, pruned_edges, x, edge_attr=pruned_edge_attr)
 
         h = self.node_dec(h)
         h = h * node_mask

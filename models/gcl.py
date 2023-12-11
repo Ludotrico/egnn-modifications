@@ -1,5 +1,7 @@
 from torch import nn
 import torch
+import torch_geometric
+import torch_sparse
 
 class MLP(nn.Module):
     """ a simple 4-layer MLP """
@@ -142,6 +144,15 @@ class GCL_rf(GCL_basic):
         return x_out
 
 
+def select_neighborhood(edge_index, coord, threshold=0.5):
+    # Compute the Euclidean distance between nodes
+    row, col = edge_index
+    distance = torch.norm(coord[row] - coord[col], dim=1)
+
+    # Select edges where distance is below the threshold
+    mask = distance < threshold
+    return edge_index[:, mask]
+
 class E_GCL(nn.Module):
     """Graph Neural Net with global state and fixed number of nodes per graph.
     Args:
@@ -240,7 +251,10 @@ class E_GCL(nn.Module):
         return radial, coord_diff
 
     def forward(self, h, edge_index, coord, edge_attr=None, node_attr=None):
-        row, col = edge_index
+        # Select neighborhood
+        selected_edges = select_neighborhood(edge_index, coord)
+
+        row, col = selected_edges
         radial, coord_diff = self.coord2radial(edge_index, coord)
 
         edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
@@ -271,6 +285,36 @@ class E_GCL_vel(E_GCL):
 
     def forward(self, h, edge_index, coord, vel, edge_attr=None, node_attr=None):
         row, col = edge_index
+        radial, coord_diff = self.coord2radial(edge_index, coord)
+
+        edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        coord = self.coord_model(coord, edge_index, coord_diff, edge_feat)
+
+
+        coord += self.coord_mlp_vel(h) * vel
+        h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
+        # coord = self.node_coord_model(h, coord)
+        # x = self.node_model(x, edge_index, x[col], u, batch)  # GCN
+        return h, coord, edge_attr
+
+
+
+class E_GCL_sparse(E_GCL):
+
+
+    def __init__(self, input_nf, output_nf, hidden_nf, edges_in_d=0, nodes_att_dim=0, act_fn=nn.ReLU(), recurrent=True, coords_weight=1.0, attention=False, norm_diff=False, tanh=False):
+        E_GCL.__init__(self, input_nf, output_nf, hidden_nf, edges_in_d=edges_in_d, nodes_att_dim=nodes_att_dim, act_fn=act_fn, recurrent=recurrent, coords_weight=coords_weight, attention=attention, norm_diff=norm_diff, tanh=tanh)
+        self.norm_diff = norm_diff
+        self.coord_mlp_vel = nn.Sequential(
+            nn.Linear(input_nf, hidden_nf),
+            act_fn,
+            nn.Linear(hidden_nf, 1))
+
+    def forward(self, h, edge_index, coord, vel, edge_attr=None, node_attr=None):
+        # Convert to sparse format
+        edge_index_sparse = torch_sparse.SparseTensor(row=edge_index[0], col=edge_index[1], value=edge_attr)
+
+        row, col = edge_index_sparse
         radial, coord_diff = self.coord2radial(edge_index, coord)
 
         edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
